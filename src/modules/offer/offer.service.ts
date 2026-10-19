@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { PaginationDto } from '../../common/pagination.dto';
 import { CreateOfferDto } from './dto/create-offer.dto';
 import { UpdateOfferDto } from './dto/update-offer.dto';
@@ -73,7 +73,10 @@ export class OfferService {
       p.take ?? 20,
       sortBy,
       sortOrder,
-    );
+    ).then((page) => ({
+      ...page,
+      items: page.items.map((offer) => this.maskPaymentMethods(offer)),
+    }));
   }
 
   async get(id: string): Promise<OfferWithRelations> {
@@ -84,13 +87,50 @@ export class OfferService {
         `Offer ${id} not found`,
       );
     }
-    return item;
+    return this.maskPaymentMethods(item);
   }
 
-  async update(id: string, dto: UpdateOfferDto): Promise<Offer> {
-    const updated = (await this.repo.update(
+  /** Offer discovery is public; never serialize payment account details here. */
+  private maskPaymentMethods(offer: OfferWithRelations): OfferWithRelations {
+    return {
+      ...offer,
+      payment_methods: offer.payment_methods.map((method) => ({
+        ...method,
+        accountIdentifier: this.maskIdentifier(method.accountIdentifier),
+        beneficiaryName: null,
+      })),
+    };
+  }
+
+  private maskIdentifier(value: string): string {
+    const visibleSuffix = value.slice(-4);
+    return `${'*'.repeat(Math.max(4, value.length - visibleSuffix.length))}${visibleSuffix}`;
+  }
+
+  async update(
+    id: string,
+    dto: UpdateOfferDto,
+    actorId: string,
+  ): Promise<Offer> {
+    const current = await this.repo.findById(id);
+    if (!current) {
+      throw new AppException(ErrorCode.OFFER_NOT_FOUND, `Offer ${id} not found`);
+    }
+    if (
+      current.creatorId !== actorId &&
+      (await this.repo.getUserRole(actorId)) !== 'admin'
+    ) {
+      throw new ForbiddenException('Only the offer creator or an admin can update it');
+    }
+    const { expectedVersion, ...changes } = dto;
+    const updated = (await this.repo.updateWithVersion(
       id,
-      dto as unknown as Record<string, unknown>,
+      changes as Record<string, unknown>,
+      expectedVersion,
+    )) as Offer;
+      id,
+      changes as Record<string, unknown>,
+      expectedVersion,
     )) as Offer;
 
     await this.auditLogService.create({
@@ -104,7 +144,12 @@ export class OfferService {
     return updated;
   }
 
-  async remove(id: string): Promise<Offer> {
+  async remove(id: string, actorId: string): Promise<Offer> {
+    const current = await this.repo.findById(id);
+    if (!current) throw new NotFoundException('Offer not found');
+    if (current.creatorId !== actorId && (await this.repo.getUserRole(actorId)) !== 'admin') {
+      throw new ForbiddenException('Only the offer creator or an admin can delete it');
+    }
     const removed = (await this.repo.delete(id)) as Offer;
 
     await this.auditLogService.create({
